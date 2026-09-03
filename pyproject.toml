@@ -1,12 +1,12 @@
 [tool.poetry]
 name = "docuware-client"
-version = "0.5.2"
+version = "0.5.2+expodocs.1"
 description = "DocuWare REST-API client"
 authors = ["Stefan Schönberger <mail@sniner.dev>"]
 readme = "README.md"
 packages = [{ include = "docuware" }]
 license = "BSD-3-Clause"
-repository = "https://github.com/sniner/docuware-client"
+repository = "https://github.com/Dweliw01/docuware-client"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: BSD License",

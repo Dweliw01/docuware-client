@@ -1,6 +1,6 @@
 import unittest
 
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 from docuware import utils
 
@@ -8,9 +8,10 @@ from docuware import utils
 class DateTimeTests(unittest.TestCase):
 
     DATETIME_1 = datetime(2022, 3, 5, 13, 37, 24)
-    DATETIME_1_STR = "/Date(1646483844000)/"
+    # Naive dates follow the host timezone, not an assumed Europe/Berlin host.
+    DATETIME_1_STR = f"/Date({int(DATETIME_1.timestamp()) * 1000})/"
     DATE_1 = date(2022, 3, 5)
-    DATE_1_STR = "/Date(1646434800000)/"
+    DATE_1_STR = f"/Date({int(datetime(2022, 3, 5).timestamp()) * 1000})/"
 
     def test_datetime2str(self):
         self.assertEqual(utils.datetime_to_string(self.DATETIME_1), self.DATETIME_1_STR)
@@ -19,4 +20,9 @@ class DateTimeTests(unittest.TestCase):
     def test_date2str(self):
         self.assertEqual(utils.date_to_string(self.DATE_1), self.DATE_1_STR)
         self.assertEqual(utils.date_from_string(self.DATE_1_STR), self.DATE_1)
+
+    def test_utc_datetime_has_fixed_epoch(self):
+        """Retain a fixed external oracle independent of the host timezone."""
+        value = datetime(2022, 3, 5, 12, 37, 24, tzinfo=timezone.utc)
+        self.assertEqual(utils.datetime_to_string(value), "/Date(1646483844000)/")
 

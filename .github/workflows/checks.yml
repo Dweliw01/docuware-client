@@ -1,0 +1,45 @@
+name: Fork checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tooling Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Poetry
+        run: python -m pip install poetry==2.4.2
+      - name: Supported package Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install locked dependencies
+        run: |
+          poetry env use "$(command -v python)"
+          poetry install --no-interaction
+      - name: Tests
+        run: poetry run pytest
+      - name: Blocking Pylint error gate
+        run: poetry run pylint --errors-only docuware tests
+      - name: Unrestricted Pylint report (existing style backlog, not a pass)
+        if: always()
+        run: poetry run pylint docuware tests --exit-zero > pylint-full.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pylint-full-${{ matrix.python }}
+          path: pylint-full.txt
+      - name: Build wheel and sdist
+        run: poetry build
