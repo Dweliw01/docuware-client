@@ -1,5 +1,9 @@
 from __future__ import annotations
 import logging
+import math
+import tempfile
+import time
+from pathlib import Path
 import requests
 import urllib.parse as urlparse
 from abc import ABC, abstractmethod
@@ -30,6 +34,14 @@ TEXT_HEADERS = {
 }
 
 class Authenticator(ABC):
+    def is_token_expired(self) -> bool:
+        """Cookie authenticators have no access-token expiry metadata."""
+        return False
+
+    def relogin(self, conn: Connection) -> dict:
+        """Reauthenticate using the credentials retained by the authenticator."""
+        return self.login(conn)
+
     @abstractmethod
     def authenticate(self, conn: Connection) -> requests.Session:
         ...
@@ -128,7 +140,28 @@ class OAuth2Authenticator(Authenticator):
         self.username = username
         self.organization = organization
         self.token = (saved_state or {}).get("access_token")
+        self.acquired_at = (saved_state or {}).get("acquired_at")
+        self.expires_in = (saved_state or {}).get("expires_in")
         self.result: dict = {}
+
+    def is_token_expired(self) -> bool:
+        """Unknown, invalid, future-dated, and missing token state is expired."""
+        if not isinstance(self.token, str) or not self.token:
+            return True
+        values = (self.acquired_at, self.expires_in)
+        try:
+            invalid = any(isinstance(value, bool) or not isinstance(value, (int, float))
+                          or not math.isfinite(value) or value < 0 for value in values)
+        except OverflowError:
+            return True
+        if invalid:
+            return True
+        now = time.time()
+        return now < self.acquired_at or now >= self.acquired_at + self.expires_in
+
+    def _saved_state(self) -> dict:
+        return {"access_token": self.token, "acquired_at": self.acquired_at,
+                "expires_in": self.expires_in}
 
     def _apply_access_token(self, conn: Connection, token: Optional[str]) -> None:
         if token:
@@ -139,9 +172,10 @@ class OAuth2Authenticator(Authenticator):
             if "Authorization" in conn.session.headers:
                 del conn.session.headers["Authorization"]
 
-    def _get_access_token(self, conn: Connection) -> Optional[str]:
+    def _get_access_token(self, conn: Connection) -> str:
         log.debug("Requesting access token")
         try:
+            acquired_at = time.time()
             # According to https://support.docuware.com/en-us/knowledgebase/article/KBA-37505:
             # Step 1: Get responsible Identity Service
             res = self._get(conn, "/DocuWare/Platform/Home/IdentityServiceInfo")
@@ -161,30 +195,53 @@ class OAuth2Authenticator(Authenticator):
             }
             self.result = self._post(conn, path, data=data)
             token = self.result.get("access_token")
-            if not token:
-               raise errors.ResourceError(status_code=599)
+            if not isinstance(token, str) or not token:
+                raise errors.AccountError("Token response is missing an access token")
+            self.acquired_at = acquired_at
+            self.expires_in = self.result.get("expires_in")
             return token
         except errors.ResourceError as exc:
-            log.warning("Failed to get access token (%s)", exc.status_code)
-        return None
+            raise errors.AccountError("Access-token authentication failed",
+                                      status_code=exc.status_code) from None
+        except (ValueError, TypeError, AttributeError, requests.exceptions.InvalidJSONError):
+            # Requests JSONDecodeError is also a RequestException, but is a bad
+            # token response rather than a retryable network failure.
+            raise errors.AccountError("Access-token authentication failed") from None
+        except requests.RequestException as exc:
+            # Preserve timeout/connection classification for callers' retry policy,
+            # but discard request objects and provider/transport diagnostic text.
+            raise type(exc)("Access-token transport failed") from None
 
     def authenticate(self, conn: Connection) -> requests.Session:
+        # A failed login must not leave a stale bearer header available for reuse.
+        self.token = None
+        self.acquired_at = None
+        self.expires_in = None
+        self.result = {}
+        self._apply_access_token(conn, None)
         self.token = self._get_access_token(conn)
         self._apply_access_token(conn, self.token)
         return conn.session
 
     def login(self, conn: Connection) -> dict:
-        self._apply_access_token(conn, self.token)
+        if self.is_token_expired():
+            conn.session = self.authenticate(conn)
+        else:
+            self._apply_access_token(conn, self.token)
+        return self._saved_state()
+
+    def relogin(self, conn: Connection) -> dict:
+        """Force a single login, even if the current token has not expired."""
         conn.session = self.authenticate(conn)
-        return {
-            "access_token": self.token,
-        }
+        return self._saved_state()
 
     def logoff(self, conn: Connection) -> None:
         if self.token:
             # FIXME: How to revoke an access token?
             #self._get(conn, "/DocuWare/Identity/connect/revocation")
             self.token = None
+            self.acquired_at = None
+            self.expires_in = None
             self._apply_access_token(conn, None)
 
 
@@ -201,6 +258,16 @@ class Connection:
         self.session.verify = verify_certificate
         self.authenticator = authenticator
         self._json_object_hook = cijson.case_insensitive_hook if case_insensitive else None
+
+    def is_token_expired(self) -> bool:
+        """Return OAuth expiry, or True when no authenticator is configured."""
+        return self.authenticator is None or self.authenticator.is_token_expired()
+
+    def relogin(self) -> dict:
+        """Explicit reauthentication; callers own spacing and lockout policy."""
+        if self.authenticator is None:
+            raise errors.AccountError("No authenticator configured")
+        return self.authenticator.relogin(self)
 
     def make_path(self, path: str, query: dict) -> str:
         u = urlparse.urlsplit(path)
@@ -273,12 +340,15 @@ class Connection:
         headers = {**headers, **TEXT_HEADERS} if headers else TEXT_HEADERS
         return self.put(path, headers=headers, params=params, json=json, data=data).text
 
-    def _get(self, url: str, headers: Optional[Dict[str, str]] = None, data: Optional[Any] = None):
+    def _get(self, url: str, headers: Optional[Dict[str, str]] = None,
+             data: Optional[Any] = None, *, stream: bool = False):
         headers = {**DEFAULT_HEADERS, **headers} if headers else DEFAULT_HEADERS
-        resp = self.session.get(url, headers=headers, data=data)
+        options = {"stream": True, "timeout": (10, 60)} if stream else {}
+        resp = self.session.get(url, headers=headers, data=data, **options)
         if resp.status_code in (401, 403) and self.authenticator:
+            resp.close()
             self.session = self.authenticator.authenticate(self)
-            resp = self.session.get(url, headers=headers, data=data)
+            resp = self.session.get(url, headers=headers, data=data, **options)
         return resp
 
     def get(self, path: str, headers: Optional[Dict[str, str]] = None, data: Optional[Any] = None):
@@ -337,5 +407,65 @@ class Connection:
         raise errors.ResourceNotFoundError(
             f"Download failed, code {resp.status_code}",
             url=url, status_code=resp.status_code)
+
+    def stream_to_file(self, url: str, dest: Path, *,
+                       expected_size: Optional[int] = None) -> Path:
+        """Stream identity-encoded bytes; atomically replace dest only on success.
+
+        The parent directory must exist. Symlink destinations are rejected; any
+        existing regular file remains intact on HTTP, size, or write failure.
+        """
+        if expected_size is not None and (
+                isinstance(expected_size, bool) or not isinstance(expected_size, int)
+                or expected_size < 0):
+            raise ValueError("expected_size must be a non-negative integer or None")
+        dest = Path(dest)
+        if dest.is_symlink():
+            raise ValueError("Symlink destinations are not supported")
+        url = self.make_url(url)
+        response = self._get(url, headers={"Accept": "*/*", "Accept-Encoding": "identity"},
+                             stream=True)
+        temporary = None
+        try:
+            if response.status_code != 200:
+                raise errors.ResourceError("Stream download failed", url=url,
+                                           status_code=response.status_code)
+            # iter_content transparently decompresses, while Content-Length counts
+            # encoded bytes. Require identity instead of silently comparing unlike sizes.
+            if response.headers.get("Content-Encoding", "identity").lower() != "identity":
+                raise errors.ResourceError("Stream download requires identity encoding", url=url)
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None:
+                if not content_length.isascii() or not content_length.isdecimal():
+                    raise errors.ResourceError("Invalid Content-Length", url=url)
+                content_length = int(content_length)
+            sizes = [size for size in (content_length, expected_size) if size is not None]
+            if len(set(sizes)) > 1:
+                raise errors.ResourceError("Content-Length disagrees with expected_size", url=url)
+            transferred = 0
+            with tempfile.NamedTemporaryFile(mode="wb", dir=dest.parent,
+                                             prefix=f".{dest.name}.", delete=False) as output:
+                temporary = Path(output.name)
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    transferred += len(chunk)
+                    if sizes and transferred > sizes[0]:
+                        raise errors.ResourceError("Downloaded size exceeds expected length", url=url)
+                    output.write(chunk)
+            if sizes and transferred != sizes[0]:
+                raise errors.ResourceError(
+                    f"Unexpected content length: expected {sizes[0]}, got {transferred}", url=url)
+            if dest.is_symlink():
+                raise ValueError("Symlink destinations are not supported")
+            temporary.replace(dest)
+            temporary = None
+            return dest
+        finally:
+            try:
+                response.close()
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
 
 # vim: set et sw=4 ts=4:

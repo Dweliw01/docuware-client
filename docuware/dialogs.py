@@ -1,6 +1,7 @@
 from __future__ import annotations
 import logging
 import re
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from datetime import datetime, date
 from typing import Any, Iterator, Union, List, Optional, Tuple, Dict
 
@@ -86,9 +87,11 @@ class SearchDialog(Dialog):
         self._load()
         return self._fields or {}
 
-    def search(self, conditions: dict[str, str], operation: Optional[str] = None):
+    def search(self, conditions: dict[str, str], operation: Optional[str] = None,
+               start: int = 0, count: Optional[int] = None):
         self._load()
-        return self._query.search(conditions=conditions, operation=operation)
+        return self._query.search(conditions=conditions, operation=operation,
+                                  start=start, count=count)
 
 
 class SearchField:
@@ -197,7 +200,15 @@ class SearchQuery:
     def conn(self) -> conn.Connection:
         return self.dialog.client.conn
 
-    def search(self, conditions: Conditions, operation: str = None, sort_field: str = None, sort_order: str = None) -> SearchResult:
+    def search(self, conditions: Conditions, operation: str = None,
+               sort_field: str = None, sort_order: str = None,
+               start: int = 0, count: Optional[int] = None) -> SearchResult:
+        """Search one page when count is supplied; otherwise retain lazy next links."""
+        if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+            raise ValueError("start must be a non-negative integer")
+        if count is not None and (
+                isinstance(count, bool) or not isinstance(count, int) or count <= 0):
+            raise ValueError("count must be a positive integer or None")
         terms = self.cond_parser.parse(conditions)
         query = {"fields": ",".join([t[0] for t in terms])}
         if sort_field:
@@ -209,17 +220,36 @@ class SearchQuery:
             "Operation": operation or AND,
         }
         result_url = self.conn.post_text(path, json=data).split("\n", 1)[0]
+        if start or count is not None:
+            # Paging belongs on the actual result GET, not the link-creation POST.
+            # Replace server-provided defaults rather than append duplicate params.
+            parts = urlsplit(result_url)
+            paging_keys = {"start", "calculatetotalcount"}
+            if count is not None:
+                paging_keys.add("count")
+            params = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
+                      if key.lower() not in paging_keys]
+            params.extend([("Start", str(start)), ("CalculateTotalCount", "true")])
+            if count is not None:
+                params.append(("Count", str(count)))
+            result_url = urlunsplit(parts._replace(query=urlencode(params)))
         result = self.conn.get_json(result_url)
-        return SearchResult(result, self)
+        return SearchResult(result, self, start=start, page_size=count)
 
     def __str__(self):
         return f"{self.__class__.__name__} [{self.dialog.id}]"
 
 
 class SearchResult:
-    def __init__(self, config: dict, query: SearchQuery):
+    def __init__(self, config: dict, query: SearchQuery,
+                 start: int = 0, page_size: Optional[int] = None):
         self.query = query
         self.count = config.get("Count", {}).get("Value", 0)
+        # count historically means total hits; do not repurpose it as page size.
+        self.total = self.count
+        self.start = start
+        self.page_size = page_size
+        self._returned = 0
         self.endpoints = structs.Endpoints(config)
         self.items = self._items(config)
 
@@ -230,13 +260,16 @@ class SearchResult:
         return self
 
     def __next__(self):
+        if self.page_size is not None and self._returned >= self.page_size:
+            raise StopIteration
         while (item := next(self.items, None)) is None:
-            if "next" in self.endpoints:
+            if self.page_size is None and "next" in self.endpoints:
                 result = self.query.dialog.client.conn.get_json(self.endpoints["next"])
                 self.endpoints = structs.Endpoints(result)
                 self.items = self._items(result)
             else:
                 raise StopIteration
+        self._returned += 1
         return item
 
     def __str__(self):

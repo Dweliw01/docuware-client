@@ -66,4 +66,12 @@ class DocuwareClient(types.DocuwareClientP):
         if self.conn.authenticator:
             self.conn.authenticator.logoff(self.conn)
 
+    def is_token_expired(self) -> bool:
+        """Expose access-token expiry to the application's session policy."""
+        return self.conn.is_token_expired()
+
+    def relogin(self) -> dict:
+        """Reauthenticate once using stored credentials, propagating failures."""
+        return self.conn.relogin()
+
 # vim: set et sw=4 ts=4:

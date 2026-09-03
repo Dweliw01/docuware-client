@@ -193,6 +193,100 @@ org.users.add(user, password="123456")
 ```
 
 
+## ExpoDocs fork additions
+
+This fork keeps the `docuware` import and the `docuware-client` distribution.
+Version `0.5.2+expodocs.1` is consumed by a full Git commit SHA, not PyPI.
+The matching `v0.5.2+expodocs.1` tag is reserved for the externally reviewed
+commit; a candidate branch SHA is not yet a reviewed dependency pin.
+
+### Explicit search pages
+
+```python
+page = dlg.search({"DOCNO": "123456"}, start=20, count=10)
+items = list(page)
+print(page.total, page.start, page.page_size)
+```
+
+`start` is a non-negative offset and `count` is a positive page size or `None`.
+Explicit paging places `Start`, `Count`, and `CalculateTotalCount=true` on the
+result-link GET, replacing existing defaults but preserving unrelated query
+parameters. `total` exposes DocuWare's `Count.Value`; the existing `count`
+attribute retains its historical meaning (total, not page size).
+An explicit `count` bounds iteration to that response and never follows its
+next link. Omit `count` to retain the original lazy traversal of all next links.
+If a server returns fewer than requested, the page contains fewer items.
+
+### Streamed files
+
+```python
+from pathlib import Path
+
+dw.conn.stream_to_file(download_url, Path("download.pdf"), expected_size=12345)
+```
+
+The caller supplies a trusted URL and destination; the parent directory must
+already exist. Downloads use `stream=True`, 1 MiB chunks, a 10-second connect
+timeout and a 60-second read timeout. `expected_size` is an optional non-negative
+byte count. When present, Content-Length is checked even if expected_size is
+also supplied; missing Content-Length is allowed. Only successful, validated
+downloads atomically replace the destination. Failures preserve an existing
+file and remove the temporary sibling. Symlink destinations are rejected.
+The server must honor `Accept-Encoding: identity`: encoded responses are
+rejected to avoid comparing compressed Content-Length to decoded bytes.
+Existing `get_bytes()` and document/attachment buffered downloads are unchanged.
+
+### Token expiry and re-login
+
+```python
+if dw.is_token_expired():
+    # Apply application-level login spacing and lockout policy before this call.
+    saved_state = dw.relogin()
+```
+
+The same methods are exposed on `dw.conn`. OAuth saved state includes the
+original Unix `acquired_at` time and numeric `expires_in` lifetime. Restoring
+valid state neither resets its age nor reauthenticates. Missing, malformed,
+future-dated, or expired metadata is conservatively treated as expired;
+legacy saved states without lifetime metadata need one fresh login.
+`relogin()` always makes exactly one authentication attempt with retained
+credentials. A failed attempt clears stale bearer state. HTTP authentication
+failures raise `AccountError` with the upstream `status_code`; malformed token
+responses raise `AccountError` without a status code. Transport failures retain
+their Requests exception class (such as `Timeout` or `ConnectionError`) so
+callers can distinguish network failures from credential rejection. All these
+errors use fixed safe messages without request objects or provider body details.
+**Do not treat every AccountError as bad credentials**: provider 5xx and
+malformed responses are not credential rejection.
+There is no proactive background refresh or extra retry loop. The pre-existing
+one retry after a resource returns 401/403 remains; callers still own spacing.
+Cookie authentication has no access-token expiry and reports `False`.
+
+### Fork checks and current lint limitation
+
+```console
+poetry install
+poetry run pytest
+poetry run pylint --errors-only docuware tests
+poetry run pylint docuware tests
+poetry build
+```
+
+CI tests Python 3.9 and 3.12, gates on tests and Pylint errors, and builds both
+wheel and sdist. The full, unrestricted Pylint command still reports inherited
+convention/refactor/warning debt; it is **not a clean lint pass**. CI publishes
+that unrestricted report as an artifact using `--exit-zero`, separately from
+the blocking errors-only gate. WO-1.1 acceptance criterion 1 therefore remains
+partially unmet pending a reviewer decision on that pre-existing baseline;
+this change does not hide it with global lint suppressions or broad cleanup.
+The new checks are offline and do not claim verification against a live
+DocuWare tenant.
+
+References: [DocuWare paging limits](https://support.docuware.com/en-us/knowledgebase/article/KBA-36909),
+[calculated totals](https://developer.docuware.com/dotNet_API_Reference/PlatformServerClient/DocuWare.Platform.ServerClient.ResultListQuery.html),
+[OAuth discovery](https://support.docuware.com/en-us/knowledgebase/article/KBA-37505),
+and [Requests streaming/cleanup](https://requests.readthedocs.io/en/stable/user/advanced/#body-content-workflow).
+
 ## CLI usage
 
 This package also includes a simple CLI program for collecting information
